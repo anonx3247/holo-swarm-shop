@@ -28,7 +28,7 @@ permissions:
   contents: read
   deployments: read
   statuses: read
-  pull-requests: read
+  pull-requests: write
   issues: write
 
 concurrency:

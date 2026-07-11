@@ -241,6 +241,19 @@ class Github:
                 return
         self.create_comment(number, body)
 
+    def try_upsert_comment(self, number: int, body: str) -> bool:
+        try:
+            self.upsert_comment(number, body)
+            return True
+        except RuntimeError as exc:
+            message = (
+                "Could not post/update the PR comment. The Holo QA workflow will "
+                f"continue and write the same content to the GitHub step summary. Error: {exc}"
+            )
+            print(message, file=sys.stderr)
+            append_step_summary(f"> {message}")
+            return False
+
 
 def env_int(name: str, default: int) -> int:
     try:
@@ -1093,7 +1106,7 @@ def command_plan(args: argparse.Namespace) -> int:
     write_json(args.plan_file, plan)
     tasks = [task_from_dict(task) for task in plan["tasks"]]
     profiles = [profile_from_dict(profile) for profile in plan["profiles"]]
-    github.upsert_comment(pr.number, render_plan_comment(pr, preview_url, plan["planner"], tasks, profiles))
+    github.try_upsert_comment(pr.number, render_plan_comment(pr, preview_url, plan["planner"], tasks, profiles))
     write_github_output("preview_url", preview_url)
     write_github_output("planner", plan["planner"])
     write_github_output("matrix", json.dumps(plan["matrix"], separators=(",", ":")))
@@ -1189,7 +1202,7 @@ def command_summarize(args: argparse.Namespace) -> int:
         for task in tasks
     ]
     comment = render_comment(pr, str(plan["preview_url"]), str(plan["planner"]), summaries)
-    github.upsert_comment(pr.number, comment)
+    github.try_upsert_comment(pr.number, comment)
     append_step_summary(comment.replace(COMMENT_MARKER, ""))
     if any(summary["big_regression"] for summary in summaries):
         return 1
@@ -1214,7 +1227,7 @@ def command_all() -> int:
 
     print(f"Testing {preview_url} for PR #{pr.number} with {len(tasks)} checks x 3 agents. Planner: {planner}")
     summaries = run_all_checks(pr, preview_url, files, tasks)
-    github.upsert_comment(pr.number, render_comment(pr, preview_url, planner, summaries))
+    github.try_upsert_comment(pr.number, render_comment(pr, preview_url, planner, summaries))
 
     if any(summary["big_regression"] for summary in summaries):
         return 1
