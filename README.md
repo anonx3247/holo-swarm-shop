@@ -74,9 +74,9 @@ HOLO_MAX_TIME_SECONDS_TRY_3=480
 
 The workflow is split into visible GitHub Actions stages:
 
-1. `Plan five Holo checks` reads the PR diff with OpenAI, selects up to five
+1. `Plan Holo checks` reads the PR diff with OpenAI, selects one to five
    checks, and immediately posts a PR comment listing what will be tested.
-2. `holo-agent` fans out into a GitHub Actions matrix: five checks times three
+2. `holo-agent` fans out into a GitHub Actions matrix: selected checks times three
    explicit Holo attempt profiles (`fast`, `balanced`, `deep`). Each matrix job
    shows the check title and tier in the GitHub UI and uploads its own result.
 3. `Summarize Holo QA results` downloads all agent artifacts, updates the PR

@@ -443,8 +443,10 @@ def plan_tasks_with_openai(pr: PullRequest, files: list[dict[str, Any]], max_che
         Changed files and patch excerpts:
         {diff_summary}
 
-        Choose exactly {max_checks} high-value browser regression checks for Holo agents
-        to run against the Vercel preview deployment. The target app is a no-backend
+        Choose between 1 and {max_checks} high-value browser regression checks for Holo agents
+        to run against the Vercel preview deployment. Pick fewer checks when the diff is
+        narrow and more checks only when the diff creates distinct user-visible risks.
+        The target app is a no-backend
         React/Vite commerce operations demo with storefront search/filtering, cart,
         checkout promo code HOLO15, local order creation, admin order board, and
         low-stock inventory.
@@ -474,12 +476,6 @@ def plan_tasks_with_openai(pr: PullRequest, files: list[dict[str, Any]], max_che
     tasks = parse_openai_tasks(json.loads(response_text(response)), files, max_checks)
     if not tasks:
         raise RuntimeError("OpenAI returned no usable check tasks.")
-    if len(tasks) < max_checks:
-        seen = {task.check_id for task in tasks}
-        for fallback in select_tasks(files, max_checks):
-            add_task(tasks, seen, fallback)
-            if len(tasks) >= max_checks:
-                break
     return tasks[:max_checks], f"OpenAI Responses API ({model} via {openai_base_url()})"
 
 

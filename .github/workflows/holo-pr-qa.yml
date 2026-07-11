@@ -37,7 +37,7 @@ concurrency:
 
 jobs:
   plan:
-    name: Plan five Holo checks
+    name: Plan Holo checks
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     timeout-minutes: 20
