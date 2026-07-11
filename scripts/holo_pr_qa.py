@@ -13,6 +13,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from hashlib import sha1
 from typing import Any
 
 from hai_agents import Client
@@ -49,6 +50,49 @@ ANSWER_FORMAT: dict[str, Any] = {
     ],
 }
 
+CHECK_PLAN_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "name": "holo_pr_check_plan",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "checks": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 5,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "check_id": {
+                            "type": "string",
+                            "description": "Stable lowercase id using letters, numbers, and hyphens.",
+                        },
+                        "title": {"type": "string"},
+                        "objective": {
+                            "type": "string",
+                            "description": "Concrete browser-testing task for a Holo agent.",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Why the PR diff makes this check high-value.",
+                        },
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Changed files that motivated this check.",
+                        },
+                    },
+                    "required": ["check_id", "title", "objective", "reason", "paths"],
+                },
+            }
+        },
+        "required": ["checks"],
+    },
+}
+
 
 @dataclass(frozen=True)
 class PullRequest:
@@ -70,11 +114,23 @@ class CheckTask:
     paths: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class AttemptProfile:
+    attempt: int
+    tier: str
+    agent: str
+    model: str | None
+    max_steps: int
+    max_time_s: int
+
+
 @dataclass
 class AgentRun:
     task_id: str
     attempt: int
+    tier: str
     agent: str
+    model: str | None
     status: str
     elapsed_s: float
     session_id: str | None
@@ -282,6 +338,144 @@ def summarize_files(files: list[dict[str, Any]], max_chars: int = 12000) -> str:
     return summary[:max_chars] + "\n\n[diff truncated for prompt budget]"
 
 
+def openai_base_url() -> str:
+    return os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+
+
+def openai_request(payload: dict[str, Any]) -> dict[str, Any]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for PR check planning.")
+
+    req = urllib.request.Request(
+        f"{openai_base_url()}/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "holo-pr-qa",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI Responses API failed: {exc.code} {details}") from exc
+
+
+def response_text(response: dict[str, Any]) -> str:
+    if isinstance(response.get("output_text"), str):
+        return response["output_text"]
+    for item in response.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") in {"output_text", "text"} and isinstance(content.get("text"), str):
+                return content["text"]
+    raise RuntimeError("OpenAI response did not include output text.")
+
+
+def slugify_check_id(value: str, fallback: str) -> str:
+    cleaned: list[str] = []
+    last_hyphen = False
+    for char in value.lower():
+        if char.isalnum():
+            cleaned.append(char)
+            last_hyphen = False
+        elif not last_hyphen:
+            cleaned.append("-")
+            last_hyphen = True
+    slug = "".join(cleaned).strip("-")
+    return slug[:64] or fallback
+
+
+def parse_openai_tasks(plan: dict[str, Any], files: list[dict[str, Any]], max_checks: int) -> list[CheckTask]:
+    changed_paths = {file.get("filename", "") for file in files}
+    tasks: list[CheckTask] = []
+    seen: set[str] = set()
+    for index, item in enumerate(plan.get("checks", []), start=1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        objective = str(item.get("objective") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        if not title or not objective or not reason:
+            continue
+        fallback = f"openai-check-{index}"
+        check_id = slugify_check_id(str(item.get("check_id") or title), fallback)
+        if check_id in seen:
+            check_id = f"{check_id}-{sha1(title.encode('utf-8')).hexdigest()[:6]}"
+        paths = [str(path) for path in item.get("paths", []) if str(path) in changed_paths]
+        add_task(tasks, seen, CheckTask(check_id, title, objective, reason, paths))
+        if len(tasks) >= max_checks:
+            break
+    return tasks
+
+
+def plan_tasks_with_openai(pr: PullRequest, files: list[dict[str, Any]], max_checks: int) -> tuple[list[CheckTask], str]:
+    model = os.getenv("OPENAI_PLANNER_MODEL", "gpt-5.6-luna")
+    diff_summary = summarize_files(files, max_chars=24000)
+    prompt = textwrap.dedent(
+        f"""
+        Pull request #{pr.number}: {pr.title}
+        Base branch: {pr.base_ref}
+        Head branch: {pr.head_ref}
+        PR body:
+        {pr.body or "(empty)"}
+
+        Changed files and patch excerpts:
+        {diff_summary}
+
+        Choose exactly {max_checks} high-value browser regression checks for Holo agents
+        to run against the Vercel preview deployment. The target app is a no-backend
+        React/Vite commerce operations demo with storefront search/filtering, cart,
+        checkout promo code HOLO15, local order creation, admin order board, and
+        low-stock inventory.
+
+        Prefer checks that exercise changed behavior and adjacent user-visible risk.
+        Each check must be concrete enough for browser agents to execute independently.
+        Avoid static code-review checks; these are live UI checks.
+        """
+    ).strip()
+
+    response = openai_request(
+        {
+            "model": model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior QA planner. Given a PR diff, produce browser "
+                        "regression checks that independent Holo web agents can execute."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "text": {"format": CHECK_PLAN_FORMAT},
+        }
+    )
+    tasks = parse_openai_tasks(json.loads(response_text(response)), files, max_checks)
+    if not tasks:
+        raise RuntimeError("OpenAI returned no usable check tasks.")
+    if len(tasks) < max_checks:
+        seen = {task.check_id for task in tasks}
+        for fallback in select_tasks(files, max_checks):
+            add_task(tasks, seen, fallback)
+            if len(tasks) >= max_checks:
+                break
+    return tasks[:max_checks], f"OpenAI Responses API ({model} via {openai_base_url()})"
+
+
+def select_tasks_for_pr(pr: PullRequest, files: list[dict[str, Any]], max_checks: int) -> tuple[list[CheckTask], str]:
+    try:
+        return plan_tasks_with_openai(pr, files, max_checks)
+    except Exception as exc:  # noqa: BLE001 - keep QA running if planning has a transient outage.
+        print(f"OpenAI planner failed; using heuristic fallback: {exc}", file=sys.stderr)
+        return select_tasks(files, max_checks), f"Heuristic fallback after OpenAI planner error: {exc}"
+
+
 def add_task(tasks: list[CheckTask], seen: set[str], task: CheckTask) -> None:
     if task.check_id not in seen:
         seen.add(task.check_id)
@@ -404,7 +598,38 @@ def select_tasks(files: list[dict[str, Any]], max_checks: int) -> list[CheckTask
     return tasks[:max_checks]
 
 
-def task_prompt(pr: PullRequest, preview_url: str, diff_summary: str, task: CheckTask, attempt: int) -> str:
+def configured_attempt_profiles() -> list[AttemptProfile]:
+    tier_names = ["fast", "balanced", "deep"]
+    default_agents = ["h/web-surfer-flash", "h/web-surfer-flash", "h/web-surfer-flash"]
+    agent_tiers = [item.strip() for item in os.getenv("HOLO_AGENT_TIERS", "").split(",") if item.strip()]
+    base_steps = env_int("HOLO_MAX_STEPS", 45)
+    base_time_s = env_int("HOLO_MAX_TIME_SECONDS", 360)
+    default_steps = [max(20, base_steps - 10), base_steps, base_steps + 15]
+    default_times = [max(180, base_time_s - 60), base_time_s, base_time_s + 120]
+    profiles: list[AttemptProfile] = []
+
+    for index in range(3):
+        attempt = index + 1
+        agent = (
+            os.getenv(f"HOLO_AGENT_TRY_{attempt}")
+            or os.getenv(f"HAI_AGENT_TRY_{attempt}")
+            or (agent_tiers[index] if index < len(agent_tiers) else None)
+            or default_agents[index]
+        )
+        profiles.append(
+            AttemptProfile(
+                attempt=attempt,
+                tier=os.getenv(f"HOLO_TIER_TRY_{attempt}", tier_names[index]),
+                agent=agent,
+                model=os.getenv(f"HOLO_MODEL_TRY_{attempt}") or os.getenv(f"HAI_MODEL_TRY_{attempt}"),
+                max_steps=env_int(f"HOLO_MAX_STEPS_TRY_{attempt}", default_steps[index]),
+                max_time_s=env_int(f"HOLO_MAX_TIME_SECONDS_TRY_{attempt}", default_times[index]),
+            )
+        )
+    return profiles
+
+
+def task_prompt(pr: PullRequest, preview_url: str, diff_summary: str, task: CheckTask, profile: AttemptProfile) -> str:
     return textwrap.dedent(
         f"""
         You are one of three independent Holo QA agents regression-testing a Vercel PR preview.
@@ -419,7 +644,12 @@ def task_prompt(pr: PullRequest, preview_url: str, diff_summary: str, task: Chec
         Objective: {task.objective}
         Why this was selected: {task.reason}
         Relevant changed paths: {", ".join(task.paths[:20]) or "No specific paths"}
-        Attempt: {attempt} of 3
+        Attempt: {profile.attempt} of 3
+        Execution tier: {profile.tier}
+        Agent: {profile.agent}
+        Model override: {profile.model or "none"}
+        Step budget: {profile.max_steps}
+        Time budget seconds: {profile.max_time_s}
 
         PR diff summary:
         {diff_summary}
@@ -439,30 +669,27 @@ def task_prompt(pr: PullRequest, preview_url: str, diff_summary: str, task: Chec
     ).strip()
 
 
-def run_agent(pr: PullRequest, preview_url: str, diff_summary: str, task: CheckTask, attempt: int) -> AgentRun:
-    agent = os.getenv(f"HOLO_AGENT_TRY_{attempt}") or os.getenv(f"HAI_AGENT_TRY_{attempt}")
-    if not agent:
-        agent = ["h/web-surfer-flash", "h/web-surfer-flash", "h/web-surfer-flash"][attempt - 1]
-
-    max_steps = env_int("HOLO_MAX_STEPS", 45)
-    max_time_s = env_int("HOLO_MAX_TIME_SECONDS", 360)
+def run_agent(pr: PullRequest, preview_url: str, diff_summary: str, task: CheckTask, profile: AttemptProfile) -> AgentRun:
     poll_s = env_int("HOLO_POLL_SECONDS", 5)
     started = time.time()
 
     try:
         client = Client(api_key=os.getenv("HAI_API_KEY") or os.getenv("HOLO_API_KEY"))
+        overrides: dict[str, Any] = {
+            "agent.answer_format": ANSWER_FORMAT,
+            "agent.environments[kind=web].start_url": preview_url,
+        }
+        if profile.model:
+            overrides["agent.model"] = profile.model
         session = client.sessions.create_session(
-            agent=agent,
-            messages=task_prompt(pr, preview_url, diff_summary, task, attempt),
-            max_steps=max_steps,
-            max_time_s=max_time_s,
-            overrides={
-                "agent.answer_format": ANSWER_FORMAT,
-                "agent.environments[kind=web].start_url": preview_url,
-            },
+            agent=profile.agent,
+            messages=task_prompt(pr, preview_url, diff_summary, task, profile),
+            max_steps=profile.max_steps,
+            max_time_s=profile.max_time_s,
+            overrides=overrides,
         )
 
-        deadline = time.time() + max_time_s + 90
+        deadline = time.time() + profile.max_time_s + 90
         while time.time() < deadline:
             status = client.sessions.get_session_status(session.id)
             if status.status in TERMINAL_STATUSES:
@@ -486,8 +713,10 @@ def run_agent(pr: PullRequest, preview_url: str, diff_summary: str, task: CheckT
             }
         return AgentRun(
             task_id=task.check_id,
-            attempt=attempt,
-            agent=agent,
+            attempt=profile.attempt,
+            tier=profile.tier,
+            agent=profile.agent,
+            model=profile.model,
             status=final_status.status,
             elapsed_s=round(time.time() - started, 1),
             session_id=session.id,
@@ -497,8 +726,10 @@ def run_agent(pr: PullRequest, preview_url: str, diff_summary: str, task: CheckT
     except Exception as exc:  # noqa: BLE001 - preserve failures in PR comment.
         return AgentRun(
             task_id=task.check_id,
-            attempt=attempt,
-            agent=agent,
+            attempt=profile.attempt,
+            tier=profile.tier,
+            agent=profile.agent,
+            model=profile.model,
             status="runner_error",
             elapsed_s=round(time.time() - started, 1),
             session_id=None,
@@ -549,12 +780,13 @@ def summarize_task(task: CheckTask, runs: list[AgentRun]) -> dict[str, Any]:
 
 def run_all_checks(pr: PullRequest, preview_url: str, files: list[dict[str, Any]], tasks: list[CheckTask]) -> list[dict[str, Any]]:
     diff_summary = summarize_files(files)
+    profiles = configured_attempt_profiles()
     futures = []
-    max_workers = env_int("HOLO_MAX_WORKERS", len(tasks) * 3)
+    max_workers = env_int("HOLO_MAX_WORKERS", len(tasks) * len(profiles))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for task in tasks:
-            for attempt in range(1, 4):
-                futures.append(executor.submit(run_agent, pr, preview_url, diff_summary, task, attempt))
+            for profile in profiles:
+                futures.append(executor.submit(run_agent, pr, preview_url, diff_summary, task, profile))
 
         runs_by_task: dict[str, list[AgentRun]] = {task.check_id: [] for task in tasks}
         for future in as_completed(futures):
@@ -568,7 +800,7 @@ def md_escape(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
-def render_comment(pr: PullRequest, preview_url: str, summaries: list[dict[str, Any]]) -> str:
+def render_comment(pr: PullRequest, preview_url: str, planner: str, summaries: list[dict[str, Any]]) -> str:
     big_regressions = [summary for summary in summaries if summary["big_regression"]]
     status = "fail" if big_regressions else "pass"
     lines = [
@@ -576,6 +808,7 @@ def render_comment(pr: PullRequest, preview_url: str, summaries: list[dict[str, 
         f"## Holo PR QA: {status.upper()}",
         "",
         f"Preview tested: {preview_url}",
+        f"Check planner: {planner}",
         f"Checks selected: {len(summaries)}. Agents per check: 3.",
         "",
     ]
@@ -622,12 +855,13 @@ def render_comment(pr: PullRequest, preview_url: str, summaries: list[dict[str, 
             else:
                 evidence_text = str(evidence)
             session = run.agent_view_url or run.session_id or ""
+            agent_label = run.agent if not run.model else f"{run.agent} / {run.model}"
             lines.append(
                 "| "
                 + " | ".join(
                     [
-                        str(run.attempt),
-                        md_escape(run.agent),
+                        f"{run.attempt} ({md_escape(run.tier)})",
+                        md_escape(agent_label),
                         md_escape(run.status if not run.error else f"{run.status}: {run.error}"),
                         normalize_severity(run.answer),
                         "yes" if run.answer.get("regression_detected") else "no",
@@ -661,6 +895,8 @@ def main() -> int:
     token = os.getenv("GITHUB_TOKEN")
     if not repo or not token:
         raise RuntimeError("GITHUB_REPOSITORY and GITHUB_TOKEN are required.")
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is required for OpenAI diff-based check planning.")
     if not (os.getenv("HAI_API_KEY") or os.getenv("HOLO_API_KEY")):
         raise RuntimeError("Set HAI_API_KEY or HOLO_API_KEY for Holo agent runs.")
 
@@ -668,11 +904,11 @@ def main() -> int:
     pr = github.get_pr(get_pr_number())
     files = github.list_pr_files(pr.number)
     preview_url = discover_preview_url(github, pr)
-    tasks = select_tasks(files, env_int("HOLO_MAX_CHECKS", 5))
+    tasks, planner = select_tasks_for_pr(pr, files, env_int("HOLO_MAX_CHECKS", 5))
 
-    print(f"Testing {preview_url} for PR #{pr.number} with {len(tasks)} checks x 3 agents.")
+    print(f"Testing {preview_url} for PR #{pr.number} with {len(tasks)} checks x 3 agents. Planner: {planner}")
     summaries = run_all_checks(pr, preview_url, files, tasks)
-    github.upsert_comment(pr.number, render_comment(pr, preview_url, summaries))
+    github.upsert_comment(pr.number, render_comment(pr, preview_url, planner, summaries))
 
     if any(summary["big_regression"] for summary in summaries):
         return 1

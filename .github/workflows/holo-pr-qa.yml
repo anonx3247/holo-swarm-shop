@@ -64,10 +64,22 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           VERCEL_PREVIEW_URL: ${{ inputs.preview_url }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || 'https://api.openai.com/v1' }}
+          OPENAI_PLANNER_MODEL: ${{ vars.OPENAI_PLANNER_MODEL || 'gpt-5.6-luna' }}
           HAI_API_KEY: ${{ secrets.HAI_API_KEY }}
           HOLO_MAX_CHECKS: "5"
           HOLO_MAX_WORKERS: "15"
           HOLO_AGENT_TRY_1: ${{ vars.HOLO_AGENT_TRY_1 || 'h/web-surfer-flash' }}
           HOLO_AGENT_TRY_2: ${{ vars.HOLO_AGENT_TRY_2 || 'h/web-surfer-flash' }}
           HOLO_AGENT_TRY_3: ${{ vars.HOLO_AGENT_TRY_3 || 'h/web-surfer-flash' }}
+          HOLO_MODEL_TRY_1: ${{ vars.HOLO_MODEL_TRY_1 }}
+          HOLO_MODEL_TRY_2: ${{ vars.HOLO_MODEL_TRY_2 }}
+          HOLO_MODEL_TRY_3: ${{ vars.HOLO_MODEL_TRY_3 }}
+          HOLO_MAX_STEPS_TRY_1: ${{ vars.HOLO_MAX_STEPS_TRY_1 || '35' }}
+          HOLO_MAX_STEPS_TRY_2: ${{ vars.HOLO_MAX_STEPS_TRY_2 || '45' }}
+          HOLO_MAX_STEPS_TRY_3: ${{ vars.HOLO_MAX_STEPS_TRY_3 || '60' }}
+          HOLO_MAX_TIME_SECONDS_TRY_1: ${{ vars.HOLO_MAX_TIME_SECONDS_TRY_1 || '300' }}
+          HOLO_MAX_TIME_SECONDS_TRY_2: ${{ vars.HOLO_MAX_TIME_SECONDS_TRY_2 || '360' }}
+          HOLO_MAX_TIME_SECONDS_TRY_3: ${{ vars.HOLO_MAX_TIME_SECONDS_TRY_3 || '480' }}
         run: uv run python scripts/holo_pr_qa.py
