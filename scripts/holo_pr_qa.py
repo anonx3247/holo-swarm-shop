@@ -640,7 +640,7 @@ def configured_attempt_profiles() -> list[AttemptProfile]:
     return profiles
 
 
-def task_prompt(pr: PullRequest, preview_url: str, diff_summary: str, task: CheckTask, profile: AttemptProfile) -> str:
+def task_prompt(pr: PullRequest, preview_url: str, task: CheckTask, profile: AttemptProfile) -> str:
     return textwrap.dedent(
         f"""
         You are one of three independent Holo QA agents regression-testing a Vercel PR preview.
@@ -662,9 +662,6 @@ def task_prompt(pr: PullRequest, preview_url: str, diff_summary: str, task: Chec
         Step budget: {profile.max_steps}
         Time budget seconds: {profile.max_time_s}
 
-        PR diff summary:
-        {diff_summary}
-
         Instructions:
         - Use the browser to test the preview like a user.
         - Prefer changed functionality and adjacent regression risk over generic browsing.
@@ -680,7 +677,7 @@ def task_prompt(pr: PullRequest, preview_url: str, diff_summary: str, task: Chec
     ).strip()
 
 
-def run_agent(pr: PullRequest, preview_url: str, diff_summary: str, task: CheckTask, profile: AttemptProfile) -> AgentRun:
+def run_agent(pr: PullRequest, preview_url: str, _diff_summary: str, task: CheckTask, profile: AttemptProfile) -> AgentRun:
     poll_s = env_int("HOLO_POLL_SECONDS", 5)
     started = time.time()
 
@@ -694,7 +691,7 @@ def run_agent(pr: PullRequest, preview_url: str, diff_summary: str, task: CheckT
             overrides["agent.model"] = profile.model
         session = client.sessions.create_session(
             agent=profile.agent,
-            messages=task_prompt(pr, preview_url, diff_summary, task, profile),
+            messages=task_prompt(pr, preview_url, task, profile),
             max_steps=profile.max_steps,
             max_time_s=profile.max_time_s,
             overrides=overrides,
