@@ -36,11 +36,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  holo-pr-qa:
-    name: Run Holo browser-agent checks
+  plan:
+    name: Plan five Holo checks
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
-    timeout-minutes: 90
+    timeout-minutes: 20
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      preview_url: ${{ steps.plan.outputs.preview_url }}
+      planner: ${{ steps.plan.outputs.planner }}
 
     steps:
       - name: Check out trusted workflow code
@@ -59,17 +63,16 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
-      - name: Run Holo PR QA
+      - name: Plan checks and post interim comment
+        id: plan
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           VERCEL_PREVIEW_URL: ${{ inputs.preview_url }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || 'https://api.openai.com/v1' }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL || vars.OPENAI_BASE_URL || 'https://api.openai.com/v1' }}
           OPENAI_PLANNER_MODEL: ${{ vars.OPENAI_PLANNER_MODEL || 'gpt-5.6-luna' }}
-          HAI_API_KEY: ${{ secrets.HAI_API_KEY }}
           HOLO_MAX_CHECKS: "5"
-          HOLO_MAX_WORKERS: "15"
           HOLO_AGENT_TRY_1: ${{ vars.HOLO_AGENT_TRY_1 || 'h/web-surfer-flash' }}
           HOLO_AGENT_TRY_2: ${{ vars.HOLO_AGENT_TRY_2 || 'h/web-surfer-flash' }}
           HOLO_AGENT_TRY_3: ${{ vars.HOLO_AGENT_TRY_3 || 'h/web-surfer-flash' }}
@@ -82,4 +85,98 @@ jobs:
           HOLO_MAX_TIME_SECONDS_TRY_1: ${{ vars.HOLO_MAX_TIME_SECONDS_TRY_1 || '300' }}
           HOLO_MAX_TIME_SECONDS_TRY_2: ${{ vars.HOLO_MAX_TIME_SECONDS_TRY_2 || '360' }}
           HOLO_MAX_TIME_SECONDS_TRY_3: ${{ vars.HOLO_MAX_TIME_SECONDS_TRY_3 || '480' }}
-        run: uv run python scripts/holo_pr_qa.py
+        run: uv run python scripts/holo_pr_qa.py plan --plan-file holo-plan.json
+
+      - name: Upload Holo plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: holo-plan
+          path: holo-plan.json
+          retention-days: 7
+
+  holo-agent:
+    name: ${{ matrix.check_title }} / ${{ matrix.tier }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+
+    steps:
+      - name: Check out trusted workflow code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref }}
+
+      - name: Download Holo plan
+        uses: actions/download-artifact@v4
+        with:
+          name: holo-plan
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run visible Holo agent attempt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          HAI_API_KEY: ${{ secrets.HAI_API_KEY }}
+        run: |
+          uv run python scripts/holo_pr_qa.py run-agent \
+            --plan-file holo-plan.json \
+            --check-id '${{ matrix.check_id }}' \
+            --attempt '${{ matrix.attempt }}' \
+            --result-file result.json
+
+      - name: Upload Holo agent result
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: holo-result-${{ matrix.check_id }}-${{ matrix.attempt }}
+          path: result.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  summarize:
+    name: Summarize Holo QA results
+    needs: [plan, holo-agent]
+    runs-on: ubuntu-latest
+    if: always() && needs.plan.result == 'success'
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out trusted workflow code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref }}
+
+      - name: Download all Holo artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Post final Holo QA comment and set CI result
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: uv run python scripts/holo_pr_qa.py summarize --artifacts-dir artifacts

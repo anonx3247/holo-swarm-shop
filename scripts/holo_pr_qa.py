@@ -11,9 +11,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from hashlib import sha1
+from pathlib import Path
 from typing import Any
 
 from hai_agents import Client
@@ -890,7 +892,311 @@ def first_meaningful_summary(runs: list[AgentRun]) -> str:
     return "No structured summary returned."
 
 
-def main() -> int:
+def task_to_dict(task: CheckTask) -> dict[str, Any]:
+    return {
+        "check_id": task.check_id,
+        "title": task.title,
+        "objective": task.objective,
+        "reason": task.reason,
+        "paths": task.paths,
+    }
+
+
+def task_from_dict(data: dict[str, Any]) -> CheckTask:
+    return CheckTask(
+        check_id=str(data["check_id"]),
+        title=str(data["title"]),
+        objective=str(data["objective"]),
+        reason=str(data["reason"]),
+        paths=[str(path) for path in data.get("paths", [])],
+    )
+
+
+def profile_to_dict(profile: AttemptProfile) -> dict[str, Any]:
+    return {
+        "attempt": profile.attempt,
+        "tier": profile.tier,
+        "agent": profile.agent,
+        "model": profile.model,
+        "max_steps": profile.max_steps,
+        "max_time_s": profile.max_time_s,
+    }
+
+
+def profile_from_dict(data: dict[str, Any]) -> AttemptProfile:
+    return AttemptProfile(
+        attempt=int(data["attempt"]),
+        tier=str(data["tier"]),
+        agent=str(data["agent"]),
+        model=str(data["model"]) if data.get("model") else None,
+        max_steps=int(data["max_steps"]),
+        max_time_s=int(data["max_time_s"]),
+    )
+
+
+def pr_to_dict(pr: PullRequest) -> dict[str, Any]:
+    return {
+        "number": pr.number,
+        "head_sha": pr.head_sha,
+        "base_ref": pr.base_ref,
+        "head_ref": pr.head_ref,
+        "title": pr.title,
+        "body": pr.body,
+        "html_url": pr.html_url,
+    }
+
+
+def pr_from_dict(data: dict[str, Any]) -> PullRequest:
+    return PullRequest(
+        number=int(data["number"]),
+        head_sha=str(data["head_sha"]),
+        base_ref=str(data["base_ref"]),
+        head_ref=str(data["head_ref"]),
+        title=str(data["title"]),
+        body=str(data.get("body") or ""),
+        html_url=str(data.get("html_url") or ""),
+    )
+
+
+def run_to_dict(run: AgentRun) -> dict[str, Any]:
+    return {
+        "task_id": run.task_id,
+        "attempt": run.attempt,
+        "tier": run.tier,
+        "agent": run.agent,
+        "model": run.model,
+        "status": run.status,
+        "elapsed_s": run.elapsed_s,
+        "session_id": run.session_id,
+        "agent_view_url": run.agent_view_url,
+        "answer": run.answer,
+        "error": run.error,
+    }
+
+
+def run_from_dict(data: dict[str, Any]) -> AgentRun:
+    return AgentRun(
+        task_id=str(data["task_id"]),
+        attempt=int(data["attempt"]),
+        tier=str(data["tier"]),
+        agent=str(data["agent"]),
+        model=str(data["model"]) if data.get("model") else None,
+        status=str(data["status"]),
+        elapsed_s=float(data.get("elapsed_s") or 0),
+        session_id=str(data["session_id"]) if data.get("session_id") else None,
+        agent_view_url=str(data["agent_view_url"]) if data.get("agent_view_url") else None,
+        answer=data.get("answer") if isinstance(data.get("answer"), dict) else {},
+        error=str(data["error"]) if data.get("error") else None,
+    )
+
+
+def write_json(path: str | Path, data: dict[str, Any]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def load_json(path: str | Path) -> dict[str, Any]:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def write_github_output(name: str, value: str) -> None:
+    output_path = os.getenv("GITHUB_OUTPUT")
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as output:
+            output.write(f"{name}={value}\n")
+
+
+def append_step_summary(markdown: str) -> None:
+    summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as summary:
+            summary.write(markdown)
+            summary.write("\n")
+
+
+def render_plan_comment(pr: PullRequest, preview_url: str, planner: str, tasks: list[CheckTask], profiles: list[AttemptProfile]) -> str:
+    lines = [
+        COMMENT_MARKER,
+        "## Holo PR QA: PLANNED",
+        "",
+        f"Preview selected: {preview_url}",
+        f"Check planner: {planner}",
+        f"Checks selected: {len(tasks)}. Agent attempts per check: {len(profiles)}.",
+        "",
+        "| Check | Why | Changed paths |",
+        "| --- | --- | --- |",
+    ]
+    for task in tasks:
+        paths = ", ".join(task.paths[:8]) if task.paths else "Diff-wide"
+        lines.append(f"| {md_escape(task.title)} | {md_escape(task.reason)} | {md_escape(paths)} |")
+    lines.extend(["", "| Attempt | Tier | Agent / model | Budget |", "| ---: | --- | --- | --- |"])
+    for profile in profiles:
+        agent_label = profile.agent if not profile.model else f"{profile.agent} / {profile.model}"
+        lines.append(
+            f"| {profile.attempt} | {md_escape(profile.tier)} | {md_escape(agent_label)} | "
+            f"{profile.max_steps} steps, {profile.max_time_s}s |"
+        )
+    lines.append("")
+    lines.append("_The 15 Holo agent runs are starting as separate GitHub Actions matrix jobs._")
+    return "\n".join(lines)
+
+
+def build_matrix(tasks: list[CheckTask], profiles: list[AttemptProfile]) -> dict[str, list[dict[str, Any]]]:
+    include = []
+    for task in tasks:
+        for profile in profiles:
+            include.append(
+                {
+                    "check_id": task.check_id,
+                    "check_title": task.title[:80],
+                    "attempt": profile.attempt,
+                    "tier": profile.tier,
+                    "agent": profile.agent,
+                }
+            )
+    return {"include": include}
+
+
+def make_plan(github: Github, pr: PullRequest, files: list[dict[str, Any]], preview_url: str) -> dict[str, Any]:
+    tasks, planner = select_tasks_for_pr(pr, files, env_int("HOLO_MAX_CHECKS", 5))
+    profiles = configured_attempt_profiles()
+    return {
+        "pr": pr_to_dict(pr),
+        "preview_url": preview_url,
+        "planner": planner,
+        "diff_summary": summarize_files(files),
+        "tasks": [task_to_dict(task) for task in tasks],
+        "profiles": [profile_to_dict(profile) for profile in profiles],
+        "matrix": build_matrix(tasks, profiles),
+    }
+
+
+def require_common_env(*, needs_openai: bool = False, needs_holo: bool = False) -> tuple[Github, PullRequest]:
+    repo = os.getenv("GITHUB_REPOSITORY")
+    token = os.getenv("GITHUB_TOKEN")
+    if not repo or not token:
+        raise RuntimeError("GITHUB_REPOSITORY and GITHUB_TOKEN are required.")
+    if needs_openai and not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is required for OpenAI diff-based check planning.")
+    if needs_holo and not (os.getenv("HAI_API_KEY") or os.getenv("HOLO_API_KEY")):
+        raise RuntimeError("Set HAI_API_KEY or HOLO_API_KEY for Holo agent runs.")
+    github = Github(repo, token)
+    return github, github.get_pr(get_pr_number())
+
+
+def command_plan(args: argparse.Namespace) -> int:
+    github, pr = require_common_env(needs_openai=True)
+    files = github.list_pr_files(pr.number)
+    preview_url = discover_preview_url(github, pr)
+    plan = make_plan(github, pr, files, preview_url)
+    write_json(args.plan_file, plan)
+    tasks = [task_from_dict(task) for task in plan["tasks"]]
+    profiles = [profile_from_dict(profile) for profile in plan["profiles"]]
+    github.upsert_comment(pr.number, render_plan_comment(pr, preview_url, plan["planner"], tasks, profiles))
+    write_github_output("preview_url", preview_url)
+    write_github_output("planner", plan["planner"])
+    write_github_output("matrix", json.dumps(plan["matrix"], separators=(",", ":")))
+    append_step_summary(render_plan_comment(pr, preview_url, plan["planner"], tasks, profiles).replace(COMMENT_MARKER, ""))
+    return 0
+
+
+def command_run_agent(args: argparse.Namespace) -> int:
+    require_common_env(needs_holo=True)
+    plan = load_json(args.plan_file)
+    pr = pr_from_dict(plan["pr"])
+    task = next(task_from_dict(item) for item in plan["tasks"] if item["check_id"] == args.check_id)
+    profile = next(profile_from_dict(item) for item in plan["profiles"] if int(item["attempt"]) == int(args.attempt))
+    run = run_agent(pr, str(plan["preview_url"]), str(plan["diff_summary"]), task, profile)
+    write_json(args.result_file, run_to_dict(run))
+
+    severity = normalize_severity(run.answer)
+    regression = "yes" if run.answer.get("regression_detected") else "no"
+    agent_label = run.agent if not run.model else f"{run.agent} / {run.model}"
+    append_step_summary(
+        "\n".join(
+            [
+                f"## {task.title} / {run.tier}",
+                "",
+                f"- Agent: `{agent_label}`",
+                f"- Status: `{run.status}`",
+                f"- Severity: `{severity}`",
+                f"- Regression detected: `{regression}`",
+                f"- Session: {run.agent_view_url or run.session_id or 'unavailable'}",
+                "",
+                str(run.answer.get("summary") or "No structured summary returned."),
+            ]
+        )
+    )
+    print(json.dumps(run_to_dict(run), indent=2, sort_keys=True))
+    return 0
+
+
+def find_plan_file(artifacts_dir: str | Path) -> Path:
+    matches = list(Path(artifacts_dir).rglob("holo-plan.json"))
+    if not matches:
+        raise RuntimeError(f"No holo-plan.json found under {artifacts_dir}.")
+    return matches[0]
+
+
+def load_runs(artifacts_dir: str | Path) -> list[AgentRun]:
+    runs = []
+    for path in Path(artifacts_dir).rglob("result.json"):
+        runs.append(run_from_dict(load_json(path)))
+    return runs
+
+
+def command_summarize(args: argparse.Namespace) -> int:
+    github, _ = require_common_env()
+    plan = load_json(args.plan_file or find_plan_file(args.artifacts_dir))
+    pr = pr_from_dict(plan["pr"])
+    tasks = [task_from_dict(task) for task in plan["tasks"]]
+    profiles = [profile_from_dict(profile) for profile in plan["profiles"]]
+    runs = load_runs(args.artifacts_dir)
+    runs_by_task: dict[str, list[AgentRun]] = {task.check_id: [] for task in tasks}
+    for run in runs:
+        runs_by_task.setdefault(run.task_id, []).append(run)
+
+    for task in tasks:
+        existing_attempts = {run.attempt for run in runs_by_task[task.check_id]}
+        for profile in profiles:
+            if profile.attempt not in existing_attempts:
+                runs_by_task[task.check_id].append(
+                    AgentRun(
+                        task_id=task.check_id,
+                        attempt=profile.attempt,
+                        tier=profile.tier,
+                        agent=profile.agent,
+                        model=profile.model,
+                        status="missing_artifact",
+                        elapsed_s=0,
+                        session_id=None,
+                        agent_view_url=None,
+                        answer={
+                            "success": False,
+                            "regression_detected": False,
+                            "severity": "none",
+                            "confidence": 0,
+                            "summary": "This matrix job did not publish a result artifact.",
+                            "evidence": [],
+                        },
+                        error="missing result artifact",
+                    )
+                )
+
+    summaries = [
+        summarize_task(task, sorted(runs_by_task[task.check_id], key=lambda run: run.attempt))
+        for task in tasks
+    ]
+    comment = render_comment(pr, str(plan["preview_url"]), str(plan["planner"]), summaries)
+    github.upsert_comment(pr.number, comment)
+    append_step_summary(comment.replace(COMMENT_MARKER, ""))
+    if any(summary["big_regression"] for summary in summaries):
+        return 1
+    return 0
+
+
+def command_all() -> int:
     repo = os.getenv("GITHUB_REPOSITORY")
     token = os.getenv("GITHUB_TOKEN")
     if not repo or not token:
@@ -913,6 +1219,38 @@ def main() -> int:
     if any(summary["big_regression"] for summary in summaries):
         return 1
     return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run Holo PR QA orchestration.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    plan_parser = subparsers.add_parser("plan", help="Create the five-check plan and matrix.")
+    plan_parser.add_argument("--plan-file", default="holo-plan.json")
+
+    run_parser = subparsers.add_parser("run-agent", help="Run one Holo matrix cell.")
+    run_parser.add_argument("--plan-file", default="holo-plan.json")
+    run_parser.add_argument("--check-id", required=True)
+    run_parser.add_argument("--attempt", required=True, type=int)
+    run_parser.add_argument("--result-file", default="result.json")
+
+    summarize_parser = subparsers.add_parser("summarize", help="Summarize all matrix result artifacts.")
+    summarize_parser.add_argument("--artifacts-dir", default="artifacts")
+    summarize_parser.add_argument("--plan-file", default="")
+
+    subparsers.add_parser("all", help="Run the legacy single-job orchestration.")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.command == "plan":
+        return command_plan(args)
+    if args.command == "run-agent":
+        return command_run_agent(args)
+    if args.command == "summarize":
+        return command_summarize(args)
+    return command_all()
 
 
 if __name__ == "__main__":

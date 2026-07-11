@@ -72,9 +72,13 @@ HOLO_MAX_TIME_SECONDS_TRY_2=360
 HOLO_MAX_TIME_SECONDS_TRY_3=480
 ```
 
-The workflow reads the PR diff with OpenAI, selects up to five checks, and then
-the Python runner schedules three explicit Holo attempt profiles for every
-check: fast, balanced, and deep. Each profile can use a different Holo agent
-slug, model override, step budget, and timeout. The runner posts a PR comment
-and fails CI only when agents agree on a major/critical regression or one agent
-reports a critical regression.
+The workflow is split into visible GitHub Actions stages:
+
+1. `Plan five Holo checks` reads the PR diff with OpenAI, selects up to five
+   checks, and immediately posts a PR comment listing what will be tested.
+2. `holo-agent` fans out into a GitHub Actions matrix: five checks times three
+   explicit Holo attempt profiles (`fast`, `balanced`, `deep`). Each matrix job
+   shows the check title and tier in the GitHub UI and uploads its own result.
+3. `Summarize Holo QA results` downloads all agent artifacts, updates the PR
+   comment with the final table, and fails CI only when agents agree on a
+   major/critical regression or one agent reports a critical regression.
