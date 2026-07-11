@@ -1,0 +1,73 @@
+name: Holo Agent PR QA
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "src/**"
+      - "public/**"
+      - "index.html"
+      - "package.json"
+      - "package-lock.json"
+      - "vite.config.ts"
+      - "vercel.json"
+      - ".github/workflows/holo-pr-qa.yml"
+      - "scripts/holo_pr_qa.py"
+      - "pyproject.toml"
+      - "uv.lock"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to test"
+        required: true
+      preview_url:
+        description: "Optional Vercel preview URL override"
+        required: false
+
+permissions:
+  contents: read
+  deployments: read
+  statuses: read
+  pull-requests: read
+  issues: write
+
+concurrency:
+  group: holo-pr-qa-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  holo-pr-qa:
+    name: Run Holo browser-agent checks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out trusted workflow code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run Holo PR QA
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          VERCEL_PREVIEW_URL: ${{ inputs.preview_url }}
+          HAI_API_KEY: ${{ secrets.HAI_API_KEY }}
+          HOLO_MAX_CHECKS: "5"
+          HOLO_MAX_WORKERS: "15"
+          HOLO_AGENT_TRY_1: ${{ vars.HOLO_AGENT_TRY_1 || 'h/web-surfer-flash' }}
+          HOLO_AGENT_TRY_2: ${{ vars.HOLO_AGENT_TRY_2 || 'h/web-surfer-flash' }}
+          HOLO_AGENT_TRY_3: ${{ vars.HOLO_AGENT_TRY_3 || 'h/web-surfer-flash' }}
+        run: uv run python scripts/holo_pr_qa.py

@@ -1,0 +1,11 @@
+[project]
+name = "holo-swarm-shop-ci"
+version = "0.1.0"
+description = "Holo browser-agent PR QA runner for the Holo Swarm Shop demo app."
+requires-python = ">=3.13"
+dependencies = [
+    "hai-agents>=1.0.6",
+]
+
+[tool.uv]
+package = false

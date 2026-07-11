@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+"""Run Holo browser-agent PR QA against a Vercel preview deployment."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import textwrap
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Any
+
+from hai_agents import Client
+
+
+COMMENT_MARKER = "<!-- holo-pr-qa -->"
+TERMINAL_STATUSES = {"completed", "failed", "timed_out", "interrupted"}
+SEVERITY_RANK = {"none": 0, "minor": 1, "major": 2, "critical": 3}
+
+ANSWER_FORMAT: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "success": {"type": "boolean"},
+        "regression_detected": {"type": "boolean"},
+        "severity": {
+            "type": "string",
+            "enum": ["none", "minor", "major", "critical"],
+        },
+        "confidence": {"type": "number"},
+        "summary": {"type": "string"},
+        "evidence": {"type": "array", "items": {"type": "string"}},
+        "reproduction_steps": {"type": "array", "items": {"type": "string"}},
+        "expected": {"type": "string"},
+        "actual": {"type": "string"},
+        "recommendation": {"type": "string"},
+    },
+    "required": [
+        "success",
+        "regression_detected",
+        "severity",
+        "confidence",
+        "summary",
+        "evidence",
+    ],
+}
+
+
+@dataclass(frozen=True)
+class PullRequest:
+    number: int
+    head_sha: str
+    base_ref: str
+    head_ref: str
+    title: str
+    body: str
+    html_url: str
+
+
+@dataclass
+class CheckTask:
+    check_id: str
+    title: str
+    objective: str
+    reason: str
+    paths: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AgentRun:
+    task_id: str
+    attempt: int
+    agent: str
+    status: str
+    elapsed_s: float
+    session_id: str | None
+    agent_view_url: str | None
+    answer: dict[str, Any]
+    error: str | None = None
+
+
+class Github:
+    def __init__(self, repo: str, token: str) -> None:
+        self.repo = repo
+        self.token = token
+        self.api = os.getenv("GITHUB_API_URL", "https://api.github.com")
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        accept: str = "application/vnd.github+json",
+    ) -> Any:
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(
+            f"{self.api}{path}",
+            data=data,
+            method=method,
+            headers={
+                "Accept": accept,
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+                "User-Agent": "holo-pr-qa",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"GitHub API {method} {path} failed: {exc.code} {details}") from exc
+        if not raw:
+            return None
+        return json.loads(raw)
+
+    def get_pr(self, number: int) -> PullRequest:
+        data = self.request("GET", f"/repos/{self.repo}/pulls/{number}")
+        return PullRequest(
+            number=number,
+            head_sha=data["head"]["sha"],
+            base_ref=data["base"]["ref"],
+            head_ref=data["head"]["ref"],
+            title=data.get("title") or "",
+            body=data.get("body") or "",
+            html_url=data.get("html_url") or "",
+        )
+
+    def list_pr_files(self, number: int) -> list[dict[str, Any]]:
+        files: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            batch = self.request(
+                "GET",
+                f"/repos/{self.repo}/pulls/{number}/files?per_page=100&page={page}",
+            )
+            if not batch:
+                return files
+            files.extend(batch)
+            if len(batch) < 100:
+                return files
+            page += 1
+
+    def list_commit_statuses(self, sha: str) -> list[dict[str, Any]]:
+        data = self.request("GET", f"/repos/{self.repo}/commits/{sha}/status")
+        return data.get("statuses", [])
+
+    def list_deployments(self, sha: str) -> list[dict[str, Any]]:
+        query = urllib.parse.urlencode({"sha": sha, "per_page": 30})
+        return self.request("GET", f"/repos/{self.repo}/deployments?{query}") or []
+
+    def list_deployment_statuses(self, deployment_id: int) -> list[dict[str, Any]]:
+        return (
+            self.request(
+                "GET",
+                f"/repos/{self.repo}/deployments/{deployment_id}/statuses?per_page=20",
+            )
+            or []
+        )
+
+    def list_issue_comments(self, number: int) -> list[dict[str, Any]]:
+        return self.request(
+            "GET",
+            f"/repos/{self.repo}/issues/{number}/comments?per_page=100",
+        )
+
+    def create_comment(self, number: int, body: str) -> None:
+        self.request("POST", f"/repos/{self.repo}/issues/{number}/comments", body={"body": body})
+
+    def update_comment(self, comment_id: int, body: str) -> None:
+        self.request("PATCH", f"/repos/{self.repo}/issues/comments/{comment_id}", body={"body": body})
+
+    def upsert_comment(self, number: int, body: str) -> None:
+        for comment in self.list_issue_comments(number):
+            if COMMENT_MARKER in (comment.get("body") or ""):
+                self.update_comment(comment["id"], body)
+                return
+        self.create_comment(number, body)
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def load_event_pr_number() -> int | None:
+    event_path = os.getenv("GITHUB_EVENT_PATH")
+    if not event_path:
+        return None
+    try:
+        with open(event_path, encoding="utf-8") as event_file:
+            event = json.load(event_file)
+    except FileNotFoundError:
+        return None
+    pull_request = event.get("pull_request") or {}
+    return pull_request.get("number") or event.get("number")
+
+
+def get_pr_number() -> int:
+    raw = os.getenv("PR_NUMBER") or os.getenv("GITHUB_PR_NUMBER")
+    if raw:
+        return int(raw)
+    event_number = load_event_pr_number()
+    if event_number:
+        return int(event_number)
+    raise RuntimeError("Set PR_NUMBER or run from a pull request GitHub Actions event.")
+
+
+def find_vercel_url_from_statuses(statuses: list[dict[str, Any]]) -> str | None:
+    for status in statuses:
+        context = (status.get("context") or "").lower()
+        target_url = status.get("target_url") or ""
+        if "vercel" in context and status.get("state") == "success" and target_url.startswith("http"):
+            return target_url
+    for status in statuses:
+        target_url = status.get("target_url") or ""
+        if "vercel" in target_url.lower() and target_url.startswith("http"):
+            return target_url
+    return None
+
+
+def find_vercel_url_from_deployments(github: Github, pr: PullRequest) -> str | None:
+    for deployment in github.list_deployments(pr.head_sha):
+        environment = (deployment.get("environment") or "").lower()
+        if "preview" not in environment and "vercel" not in json.dumps(deployment).lower():
+            continue
+        for status in github.list_deployment_statuses(deployment["id"]):
+            target_url = status.get("target_url") or status.get("environment_url") or ""
+            if status.get("state") == "success" and target_url.startswith("http"):
+                return target_url
+    return None
+
+
+def discover_preview_url(github: Github, pr: PullRequest) -> str:
+    explicit = os.getenv("VERCEL_PREVIEW_URL") or os.getenv("HOLO_PREVIEW_URL")
+    if explicit:
+        return explicit
+
+    timeout_s = env_int("HOLO_PREVIEW_WAIT_SECONDS", 600)
+    deadline = time.time() + timeout_s
+    while True:
+        from_status = find_vercel_url_from_statuses(github.list_commit_statuses(pr.head_sha))
+        if from_status:
+            return from_status
+
+        from_deployment = find_vercel_url_from_deployments(github, pr)
+        if from_deployment:
+            return from_deployment
+
+        if time.time() >= deadline:
+            raise RuntimeError(
+                "Timed out waiting for a successful Vercel preview deployment. "
+                "Set VERCEL_PREVIEW_URL to override discovery."
+            )
+        time.sleep(15)
+
+
+def summarize_files(files: list[dict[str, Any]], max_chars: int = 12000) -> str:
+    chunks: list[str] = []
+    for file in files:
+        patch = file.get("patch") or "(binary or patch unavailable)"
+        chunks.append(
+            "\n".join(
+                [
+                    f"FILE: {file.get('filename')}",
+                    f"STATUS: {file.get('status')} +{file.get('additions', 0)} -{file.get('deletions', 0)}",
+                    patch,
+                ]
+            )
+        )
+    summary = "\n\n".join(chunks)
+    if len(summary) <= max_chars:
+        return summary
+    return summary[:max_chars] + "\n\n[diff truncated for prompt budget]"
+
+
+def add_task(tasks: list[CheckTask], seen: set[str], task: CheckTask) -> None:
+    if task.check_id not in seen:
+        seen.add(task.check_id)
+        tasks.append(task)
+
+
+def select_tasks(files: list[dict[str, Any]], max_checks: int) -> list[CheckTask]:
+    paths = [file.get("filename", "") for file in files]
+    path_blob = "\n".join(paths).lower()
+    tasks: list[CheckTask] = []
+    seen: set[str] = set()
+
+    if any(part in path_blob for part in ["checkout", "cart", "product", "storefront"]):
+        add_task(
+            tasks,
+            seen,
+            CheckTask(
+                "storefront-purchase",
+                "Storefront purchase path",
+                "Validate browse/search, product selection, cart behavior, promo/checkout steps, and confirmation path on the preview.",
+                "Changed storefront, product, cart, or checkout code.",
+                [path for path in paths if any(part in path.lower() for part in ["checkout", "cart", "product", "app/page"])],
+            ),
+        )
+
+    if any(part in path_blob for part in ["login", "auth", "session", "admin"]):
+        add_task(
+            tasks,
+            seen,
+            CheckTask(
+                "auth-admin-access",
+                "Auth and admin access",
+                "Validate login behavior, admin route protection, and the first admin screen after authentication.",
+                "Changed auth, login, or admin surface.",
+                [path for path in paths if any(part in path.lower() for part in ["login", "auth", "admin"])],
+            ),
+        )
+
+    if any(part in path_blob for part in ["admin/orders", "orders", "kanban"]):
+        add_task(
+            tasks,
+            seen,
+            CheckTask(
+                "admin-orders",
+                "Admin orders workflow",
+                "Validate the admin orders page, order list visibility, status movement or filtering, and obvious data regressions.",
+                "Changed order administration code.",
+                [path for path in paths if "order" in path.lower() or "admin" in path.lower()],
+            ),
+        )
+
+    if any(part in path_blob for part in ["/api/", "route.ts", "prisma", "schema"]):
+        add_task(
+            tasks,
+            seen,
+            CheckTask(
+                "api-data-integrity",
+                "API and data integrity",
+                "Exercise UI paths backed by changed APIs or schema, looking for broken loads, empty data, server errors, and persistence regressions.",
+                "Changed API routes, Prisma schema, or seed data.",
+                [path for path in paths if any(part in path.lower() for part in ["/api/", "route.ts", "prisma", "schema"])],
+            ),
+        )
+
+    if any(part in path_blob for part in ["globals.css", "tailwind", "layout", ".tsx"]):
+        add_task(
+            tasks,
+            seen,
+            CheckTask(
+                "responsive-visual",
+                "Responsive visual regression",
+                "Inspect the changed screens at desktop and mobile widths for layout overlap, unreadable text, missing controls, and broken navigation.",
+                "Changed visual components, layout, or CSS.",
+                [path for path in paths if any(part in path.lower() for part in ["globals.css", "tailwind", "layout", ".tsx"])],
+            ),
+        )
+
+    fallback_tasks = [
+        CheckTask(
+            "preview-smoke",
+            "Preview smoke test",
+            "Open the Vercel preview and verify the app loads without runtime errors, blank pages, or broken top-level navigation.",
+            "Always run a general smoke check.",
+            paths,
+        ),
+        CheckTask(
+            "primary-user-journey",
+            "Primary user journey",
+            "Follow the most important user path implied by the diff and verify it completes without a visible regression.",
+            "Catches broad user-facing regressions not tied to one file group.",
+            paths,
+        ),
+        CheckTask(
+            "error-boundaries-console",
+            "Runtime error scan",
+            "Explore changed pages and look for visible Next.js errors, failed data loading, broken forms, or dead controls.",
+            "Catches runtime regressions from any changed code.",
+            paths,
+        ),
+        CheckTask(
+            "navigation-regression",
+            "Navigation regression",
+            "Move between the changed pages and adjacent routes, verifying links, redirects, and back/forward behavior still work.",
+            "Catches route-level regressions.",
+            paths,
+        ),
+        CheckTask(
+            "accessibility-basics",
+            "Accessibility basics",
+            "Check changed interactive controls for reachable labels, focusability, obvious keyboard traps, and unusable contrast.",
+            "Catches severe usability regressions.",
+            paths,
+        ),
+    ]
+    for fallback in fallback_tasks:
+        add_task(tasks, seen, fallback)
+        if len(tasks) >= max_checks:
+            break
+
+    return tasks[:max_checks]
+
+
+def task_prompt(pr: PullRequest, preview_url: str, diff_summary: str, task: CheckTask, attempt: int) -> str:
+    return textwrap.dedent(
+        f"""
+        You are one of three independent Holo QA agents regression-testing a Vercel PR preview.
+
+        Preview URL: {preview_url}
+        Pull request: #{pr.number} {pr.title}
+        Base branch: {pr.base_ref}
+        Head branch: {pr.head_ref}
+        Head SHA: {pr.head_sha}
+
+        Check {task.check_id}: {task.title}
+        Objective: {task.objective}
+        Why this was selected: {task.reason}
+        Relevant changed paths: {", ".join(task.paths[:20]) or "No specific paths"}
+        Attempt: {attempt} of 3
+
+        PR diff summary:
+        {diff_summary}
+
+        Instructions:
+        - Use the browser to test the preview like a user.
+        - Prefer changed functionality and adjacent regression risk over generic browsing.
+        - Record concrete evidence: URL, visible UI text, failed step, unexpected behavior, or screenshot-observable state.
+        - Classify severity:
+          - none: no regression found
+          - minor: cosmetic issue or low-risk annoyance
+          - major: primary workflow broken, data loss risk, auth bypass, persistent server error, or feature unusable
+          - critical: app unavailable, security-sensitive exposure, checkout/payment-blocking regression, or destructive behavior
+        - Only set regression_detected=true when you observed a real regression, not speculation.
+        - Return JSON matching the requested schema.
+        """
+    ).strip()
+
+
+def run_agent(pr: PullRequest, preview_url: str, diff_summary: str, task: CheckTask, attempt: int) -> AgentRun:
+    agent = os.getenv(f"HOLO_AGENT_TRY_{attempt}") or os.getenv(f"HAI_AGENT_TRY_{attempt}")
+    if not agent:
+        agent = ["h/web-surfer-flash", "h/web-surfer-flash", "h/web-surfer-flash"][attempt - 1]
+
+    max_steps = env_int("HOLO_MAX_STEPS", 45)
+    max_time_s = env_int("HOLO_MAX_TIME_SECONDS", 360)
+    poll_s = env_int("HOLO_POLL_SECONDS", 5)
+    started = time.time()
+
+    try:
+        client = Client(api_key=os.getenv("HAI_API_KEY") or os.getenv("HOLO_API_KEY"))
+        session = client.sessions.create_session(
+            agent=agent,
+            messages=task_prompt(pr, preview_url, diff_summary, task, attempt),
+            max_steps=max_steps,
+            max_time_s=max_time_s,
+            overrides={
+                "agent.answer_format": ANSWER_FORMAT,
+                "agent.environments[kind=web].start_url": preview_url,
+            },
+        )
+
+        deadline = time.time() + max_time_s + 90
+        while time.time() < deadline:
+            status = client.sessions.get_session_status(session.id)
+            if status.status in TERMINAL_STATUSES:
+                break
+            time.sleep(poll_s)
+        else:
+            client.sessions.cancel_session(session.id)
+            time.sleep(2)
+
+        final_status = client.sessions.get_session_status(session.id)
+        final_session = client.sessions.get_session(session.id)
+        answer = final_session.latest_answer
+        if not isinstance(answer, dict):
+            answer = {
+                "success": False,
+                "regression_detected": False,
+                "severity": "none",
+                "confidence": 0,
+                "summary": "Agent did not return structured JSON.",
+                "evidence": [],
+            }
+        return AgentRun(
+            task_id=task.check_id,
+            attempt=attempt,
+            agent=agent,
+            status=final_status.status,
+            elapsed_s=round(time.time() - started, 1),
+            session_id=session.id,
+            agent_view_url=final_session.agent_view_url,
+            answer=answer,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve failures in PR comment.
+        return AgentRun(
+            task_id=task.check_id,
+            attempt=attempt,
+            agent=agent,
+            status="runner_error",
+            elapsed_s=round(time.time() - started, 1),
+            session_id=None,
+            agent_view_url=None,
+            answer={
+                "success": False,
+                "regression_detected": False,
+                "severity": "none",
+                "confidence": 0,
+                "summary": "Agent run failed before producing a result.",
+                "evidence": [],
+            },
+            error=str(exc),
+        )
+
+
+def normalize_severity(answer: dict[str, Any]) -> str:
+    severity = str(answer.get("severity") or "none").lower()
+    return severity if severity in SEVERITY_RANK else "none"
+
+
+def run_has_big_regression(run: AgentRun) -> bool:
+    answer = run.answer
+    if not bool(answer.get("regression_detected")):
+        return False
+    return SEVERITY_RANK[normalize_severity(answer)] >= SEVERITY_RANK["major"]
+
+
+def summarize_task(task: CheckTask, runs: list[AgentRun]) -> dict[str, Any]:
+    big_votes = sum(1 for run in runs if run_has_big_regression(run))
+    regression_votes = sum(1 for run in runs if bool(run.answer.get("regression_detected")))
+    max_severity = max((normalize_severity(run.answer) for run in runs), key=lambda item: SEVERITY_RANK[item])
+    critical_votes = sum(
+        1
+        for run in runs
+        if bool(run.answer.get("regression_detected")) and normalize_severity(run.answer) == "critical"
+    )
+    big_regression = big_votes >= 2 or critical_votes >= 1
+    return {
+        "task": task,
+        "runs": runs,
+        "regression_votes": regression_votes,
+        "big_votes": big_votes,
+        "max_severity": max_severity,
+        "big_regression": big_regression,
+    }
+
+
+def run_all_checks(pr: PullRequest, preview_url: str, files: list[dict[str, Any]], tasks: list[CheckTask]) -> list[dict[str, Any]]:
+    diff_summary = summarize_files(files)
+    futures = []
+    max_workers = env_int("HOLO_MAX_WORKERS", len(tasks) * 3)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for task in tasks:
+            for attempt in range(1, 4):
+                futures.append(executor.submit(run_agent, pr, preview_url, diff_summary, task, attempt))
+
+        runs_by_task: dict[str, list[AgentRun]] = {task.check_id: [] for task in tasks}
+        for future in as_completed(futures):
+            run = future.result()
+            runs_by_task[run.task_id].append(run)
+
+    return [summarize_task(task, sorted(runs_by_task[task.check_id], key=lambda run: run.attempt)) for task in tasks]
+
+
+def md_escape(value: Any) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def render_comment(pr: PullRequest, preview_url: str, summaries: list[dict[str, Any]]) -> str:
+    big_regressions = [summary for summary in summaries if summary["big_regression"]]
+    status = "fail" if big_regressions else "pass"
+    lines = [
+        COMMENT_MARKER,
+        f"## Holo PR QA: {status.upper()}",
+        "",
+        f"Preview tested: {preview_url}",
+        f"Checks selected: {len(summaries)}. Agents per check: 3.",
+        "",
+    ]
+
+    if big_regressions:
+        lines.append("CI is marked failed because at least one check found a consensus major/critical regression.")
+    else:
+        lines.append("CI is marked passed because no check found a consensus major/critical regression.")
+    lines.append("")
+
+    lines.extend(
+        [
+            "| Check | Result | Votes | Max severity | Summary |",
+            "| --- | --- | ---: | --- | --- |",
+        ]
+    )
+    for summary in summaries:
+        result = "big regression" if summary["big_regression"] else "no blocking regression"
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    md_escape(summary["task"].title),
+                    result,
+                    f"{summary['big_votes']}/3 big, {summary['regression_votes']}/3 any",
+                    summary["max_severity"],
+                    md_escape(first_meaningful_summary(summary["runs"])),
+                ]
+            )
+            + " |"
+        )
+
+    for summary in summaries:
+        lines.extend(["", f"<details><summary>{summary['task'].title}</summary>", ""])
+        lines.append(f"Reason selected: {summary['task'].reason}")
+        if summary["task"].paths:
+            lines.append(f"Changed paths: {', '.join(summary['task'].paths[:12])}")
+        lines.append("")
+        lines.extend(["| Try | Agent | Status | Severity | Regression | Evidence | Session |", "| ---: | --- | --- | --- | --- | --- | --- |"])
+        for run in summary["runs"]:
+            evidence = run.answer.get("evidence") or []
+            if isinstance(evidence, list):
+                evidence_text = "; ".join(str(item) for item in evidence[:3])
+            else:
+                evidence_text = str(evidence)
+            session = run.agent_view_url or run.session_id or ""
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(run.attempt),
+                        md_escape(run.agent),
+                        md_escape(run.status if not run.error else f"{run.status}: {run.error}"),
+                        normalize_severity(run.answer),
+                        "yes" if run.answer.get("regression_detected") else "no",
+                        md_escape(evidence_text or run.answer.get("summary", "")),
+                        md_escape(session),
+                    ]
+                )
+                + " |"
+            )
+        lines.extend(["", "</details>"])
+
+    lines.extend(
+        [
+            "",
+            "_Failure policy: this workflow fails only when at least two agents on the same check report a major/critical regression, or any agent reports a critical regression._",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def first_meaningful_summary(runs: list[AgentRun]) -> str:
+    for run in runs:
+        summary = run.answer.get("summary")
+        if summary:
+            return str(summary)
+    return "No structured summary returned."
+
+
+def main() -> int:
+    repo = os.getenv("GITHUB_REPOSITORY")
+    token = os.getenv("GITHUB_TOKEN")
+    if not repo or not token:
+        raise RuntimeError("GITHUB_REPOSITORY and GITHUB_TOKEN are required.")
+    if not (os.getenv("HAI_API_KEY") or os.getenv("HOLO_API_KEY")):
+        raise RuntimeError("Set HAI_API_KEY or HOLO_API_KEY for Holo agent runs.")
+
+    github = Github(repo, token)
+    pr = github.get_pr(get_pr_number())
+    files = github.list_pr_files(pr.number)
+    preview_url = discover_preview_url(github, pr)
+    tasks = select_tasks(files, env_int("HOLO_MAX_CHECKS", 5))
+
+    print(f"Testing {preview_url} for PR #{pr.number} with {len(tasks)} checks x 3 agents.")
+    summaries = run_all_checks(pr, preview_url, files, tasks)
+    github.upsert_comment(pr.number, render_comment(pr, preview_url, summaries))
+
+    if any(summary["big_regression"] for summary in summaries):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:  # noqa: BLE001 - make CI failure actionable.
+        print(f"holo_pr_qa failed: {exc}", file=sys.stderr)
+        raise SystemExit(2)
