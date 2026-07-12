@@ -80,7 +80,11 @@ The workflow is split into visible GitHub Actions stages:
    check.
 3. `plan-balanced` and `plan-deep` inspect prior result artifacts and only
    create retry matrices for checks whose previous tier failed, timed out, or
-   found a regression. Bigger tiers are skipped when the earlier tier passes.
+   found a regression. Those earlier tier jobs intentionally show as failed in
+   GitHub Checks so it is obvious why a bigger retry started. Bigger tiers are
+   skipped when the earlier tier passes.
 4. `Summarize Holo QA results` downloads all agent artifacts, updates the PR
    comment with the final table, and fails CI only when agents agree on a
-   major/critical regression or one agent reports a critical regression.
+   major/critical regression or one agent reports a critical regression. Each
+   agent job summary and final result row links to the Holo trajectory/session
+   so failures can be inspected.

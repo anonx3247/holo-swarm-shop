@@ -1026,6 +1026,10 @@ def write_github_output(name: str, value: str) -> None:
             output.write(f"{name}={value}\n")
 
 
+def github_annotation_escape(value: str) -> str:
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A").replace(":", "%3A").replace(",", "%2C")
+
+
 def append_step_summary(markdown: str) -> None:
     summary_path = os.getenv("GITHUB_STEP_SUMMARY")
     if summary_path:
@@ -1193,6 +1197,8 @@ def command_run_agent(args: argparse.Namespace) -> int:
     severity = normalize_severity(run.answer)
     regression = "yes" if run.answer.get("regression_detected") else "no"
     agent_label = run.agent if not run.model else f"{run.agent} / {run.model}"
+    trajectory = run.agent_view_url or run.session_id or "unavailable"
+    trajectory_markdown = f"[open Holo trajectory]({trajectory})" if str(trajectory).startswith("http") else str(trajectory)
     append_step_summary(
         "\n".join(
             [
@@ -1202,13 +1208,20 @@ def command_run_agent(args: argparse.Namespace) -> int:
                 f"- Status: `{run.status}`",
                 f"- Severity: `{severity}`",
                 f"- Regression detected: `{regression}`",
-                f"- Session: {run.agent_view_url or run.session_id or 'unavailable'}",
+                f"- Holo trajectory: {trajectory_markdown}",
                 "",
                 str(run.answer.get("summary") or "No structured summary returned."),
             ]
         )
     )
     print(json.dumps(run_to_dict(run), indent=2, sort_keys=True))
+    if should_escalate(run):
+        message = (
+            f"{task.title} / {run.tier} requires escalation. "
+            f"severity={severity}; regression={regression}; trajectory={trajectory}"
+        )
+        print(f"::error title={github_annotation_escape('Holo agent requires escalation')}::{github_annotation_escape(message)}")
+        return 1
     return 0
 
 
