@@ -76,9 +76,11 @@ The workflow is split into visible GitHub Actions stages:
 
 1. `Plan Holo checks` reads the PR diff with OpenAI, selects one to five
    checks, and immediately posts a PR comment listing what will be tested.
-2. `holo-agent` fans out into a GitHub Actions matrix: selected checks times three
-   explicit Holo attempt profiles (`fast`, `balanced`, `deep`). Each matrix job
-   shows the check title and tier in the GitHub UI and uploads its own result.
-3. `Summarize Holo QA results` downloads all agent artifacts, updates the PR
+2. `holo-fast` fans out into one visible GitHub Actions matrix job per selected
+   check.
+3. `plan-balanced` and `plan-deep` inspect prior result artifacts and only
+   create retry matrices for checks whose previous tier failed, timed out, or
+   found a regression. Bigger tiers are skipped when the earlier tier passes.
+4. `Summarize Holo QA results` downloads all agent artifacts, updates the PR
    comment with the final table, and fails CI only when agents agree on a
    major/critical regression or one agent reports a critical regression.

@@ -94,8 +94,8 @@ jobs:
           path: holo-plan.json
           retention-days: 7
 
-  holo-agent:
-    name: ${{ matrix.check_title }} / ${{ matrix.tier }}
+  holo-fast:
+    name: ${{ matrix.check_title }} / fast
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -146,9 +146,185 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  plan-balanced:
+    name: Plan balanced retries
+    needs: [plan, holo-fast]
+    runs-on: ubuntu-latest
+    if: always() && needs.plan.result == 'success'
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      has_work: ${{ steps.matrix.outputs.has_work }}
+
+    steps:
+      - name: Check out trusted workflow code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref }}
+
+      - name: Download Holo artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Build balanced retry matrix
+        id: matrix
+        run: uv run python scripts/holo_pr_qa.py matrix --artifacts-dir artifacts --attempt 2
+
+  holo-balanced:
+    name: ${{ matrix.check_title }} / balanced
+    needs: [plan, plan-balanced]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: needs.plan-balanced.outputs.has_work == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan-balanced.outputs.matrix) }}
+
+    steps:
+      - name: Check out trusted workflow code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref }}
+
+      - name: Download Holo plan
+        uses: actions/download-artifact@v4
+        with:
+          name: holo-plan
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run balanced Holo retry
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          HAI_API_KEY: ${{ secrets.HAI_API_KEY }}
+        run: |
+          uv run python scripts/holo_pr_qa.py run-agent \
+            --plan-file holo-plan.json \
+            --check-id '${{ matrix.check_id }}' \
+            --attempt '${{ matrix.attempt }}' \
+            --result-file result.json
+
+      - name: Upload Holo agent result
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: holo-result-${{ matrix.check_id }}-${{ matrix.attempt }}
+          path: result.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  plan-deep:
+    name: Plan deep retries
+    needs: [plan, holo-fast, plan-balanced, holo-balanced]
+    runs-on: ubuntu-latest
+    if: always() && needs.plan.result == 'success'
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      has_work: ${{ steps.matrix.outputs.has_work }}
+
+    steps:
+      - name: Check out trusted workflow code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref }}
+
+      - name: Download Holo artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Build deep retry matrix
+        id: matrix
+        run: uv run python scripts/holo_pr_qa.py matrix --artifacts-dir artifacts --attempt 3
+
+  holo-deep:
+    name: ${{ matrix.check_title }} / deep
+    needs: [plan, plan-deep]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: needs.plan-deep.outputs.has_work == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan-deep.outputs.matrix) }}
+
+    steps:
+      - name: Check out trusted workflow code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref }}
+
+      - name: Download Holo plan
+        uses: actions/download-artifact@v4
+        with:
+          name: holo-plan
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run deep Holo retry
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          HAI_API_KEY: ${{ secrets.HAI_API_KEY }}
+        run: |
+          uv run python scripts/holo_pr_qa.py run-agent \
+            --plan-file holo-plan.json \
+            --check-id '${{ matrix.check_id }}' \
+            --attempt '${{ matrix.attempt }}' \
+            --result-file result.json
+
+      - name: Upload Holo agent result
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: holo-result-${{ matrix.check_id }}-${{ matrix.attempt }}
+          path: result.json
+          if-no-files-found: ignore
+          retention-days: 7
+
   summarize:
     name: Summarize Holo QA results
-    needs: [plan, holo-agent]
+    needs: [plan, holo-fast, plan-balanced, holo-balanced, plan-deep, holo-deep]
     runs-on: ubuntu-latest
     if: always() && needs.plan.result == 'success'
     timeout-minutes: 10

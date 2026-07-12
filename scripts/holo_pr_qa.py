@@ -766,6 +766,16 @@ def run_has_big_regression(run: AgentRun) -> bool:
     return SEVERITY_RANK[normalize_severity(answer)] >= SEVERITY_RANK["major"]
 
 
+def should_escalate(run: AgentRun) -> bool:
+    if run.error:
+        return True
+    if run.status != "completed":
+        return True
+    if not bool(run.answer.get("success")):
+        return True
+    return bool(run.answer.get("regression_detected"))
+
+
 def summarize_task(task: CheckTask, runs: list[AgentRun]) -> dict[str, Any]:
     big_votes = sum(1 for run in runs if run_has_big_regression(run))
     regression_votes = sum(1 for run in runs if bool(run.answer.get("regression_detected")))
@@ -855,7 +865,7 @@ def render_comment(pr: PullRequest, preview_url: str, planner: str, summaries: l
         if summary["task"].paths:
             lines.append(f"Changed paths: {', '.join(summary['task'].paths[:12])}")
         lines.append("")
-        lines.extend(["| Try | Agent | Status | Severity | Regression | Evidence | Session |", "| ---: | --- | --- | --- | --- | --- | --- |"])
+        lines.extend(["| Try | Agent | Status | Severity | Regression | Evidence | Trajectory |", "| ---: | --- | --- | --- | --- | --- | --- |"])
         for run in summary["runs"]:
             evidence = run.answer.get("evidence") or []
             if isinstance(evidence, list):
@@ -863,7 +873,10 @@ def render_comment(pr: PullRequest, preview_url: str, planner: str, summaries: l
             else:
                 evidence_text = str(evidence)
             session = run.agent_view_url or run.session_id or ""
+            session_link = f"[open]({session})" if str(session).startswith("http") else md_escape(session)
             agent_label = run.agent if not run.model else f"{run.agent} / {run.model}"
+            if run.answer.get("regression_detected") and str(session).startswith("http"):
+                session_link = f"**[failure trajectory]({session})**"
             lines.append(
                 "| "
                 + " | ".join(
@@ -874,7 +887,7 @@ def render_comment(pr: PullRequest, preview_url: str, planner: str, summaries: l
                         normalize_severity(run.answer),
                         "yes" if run.answer.get("regression_detected") else "no",
                         md_escape(evidence_text or run.answer.get("summary", "")),
-                        md_escape(session),
+                        session_link,
                     ]
                 )
                 + " |"
@@ -1044,24 +1057,85 @@ def render_plan_comment(pr: PullRequest, preview_url: str, planner: str, tasks: 
             f"{profile.max_steps} steps, {profile.max_time_s}s |"
         )
     lines.append("")
-    lines.append("_The 15 Holo agent runs are starting as separate GitHub Actions matrix jobs._")
+    lines.append("_The fast Holo agents are starting first. Balanced and deep tiers run only for checks that need escalation._")
     return "\n".join(lines)
 
 
-def build_matrix(tasks: list[CheckTask], profiles: list[AttemptProfile]) -> dict[str, list[dict[str, Any]]]:
+def matrix_entry(task: CheckTask, profile: AttemptProfile) -> dict[str, Any]:
+    return {
+        "check_id": task.check_id,
+        "check_title": task.title[:80],
+        "attempt": profile.attempt,
+        "tier": profile.tier,
+        "agent": profile.agent,
+    }
+
+
+def build_matrix(tasks: list[CheckTask], profiles: list[AttemptProfile], attempt: int | None = None) -> dict[str, list[dict[str, Any]]]:
     include = []
     for task in tasks:
         for profile in profiles:
-            include.append(
-                {
-                    "check_id": task.check_id,
-                    "check_title": task.title[:80],
-                    "attempt": profile.attempt,
-                    "tier": profile.tier,
-                    "agent": profile.agent,
-                }
-            )
+            if attempt is None or profile.attempt == attempt:
+                include.append(matrix_entry(task, profile))
     return {"include": include}
+
+
+def empty_matrix() -> dict[str, list[dict[str, Any]]]:
+    return {"include": []}
+
+
+def matrix_has_work(matrix: dict[str, list[dict[str, Any]]]) -> bool:
+    return bool(matrix.get("include"))
+
+
+def build_escalation_matrix(plan: dict[str, Any], runs: list[AgentRun], next_attempt: int) -> dict[str, list[dict[str, Any]]]:
+    tasks = [task_from_dict(task) for task in plan["tasks"]]
+    profiles = [profile_from_dict(profile) for profile in plan["profiles"]]
+    next_profile = next((profile for profile in profiles if profile.attempt == next_attempt), None)
+    previous_attempt = next_attempt - 1
+    if not next_profile:
+        return empty_matrix()
+
+    runs_by_task: dict[str, list[AgentRun]] = {}
+    for run in runs:
+        runs_by_task.setdefault(run.task_id, []).append(run)
+
+    include = []
+    for task in tasks:
+        previous_run = next(
+            (run for run in runs_by_task.get(task.check_id, []) if run.attempt == previous_attempt),
+            None,
+        )
+        if previous_run is not None and should_escalate(previous_run):
+            include.append(matrix_entry(task, next_profile))
+            continue
+        if previous_run is None and next_attempt == 2:
+            include.append(matrix_entry(task, next_profile))
+            continue
+        if previous_run is None and next_attempt == 3:
+            fast_run = next(
+                (run for run in runs_by_task.get(task.check_id, []) if run.attempt == 1),
+                None,
+            )
+            if fast_run is not None and should_escalate(fast_run):
+                include.append(matrix_entry(task, next_profile))
+    return {"include": include}
+
+
+def missing_attempt_status(task_id: str, attempt: int, runs_by_task: dict[str, list[AgentRun]]) -> tuple[str, str]:
+    if attempt == 1:
+        return "missing_artifact", "This matrix job did not publish a result artifact."
+    previous_run = next(
+        (run for run in runs_by_task.get(task_id, []) if run.attempt == attempt - 1),
+        None,
+    )
+    if previous_run is not None and not should_escalate(previous_run):
+        return "skipped_no_escalation", "Skipped because the previous tier completed without a regression."
+    if attempt == 3 and previous_run is None:
+        fast_run = next((run for run in runs_by_task.get(task_id, []) if run.attempt == 1), None)
+        if fast_run is not None and not should_escalate(fast_run):
+            return "skipped_no_escalation", "Skipped because the fast tier completed without a regression."
+    return "missing_artifact", "This matrix job was expected to run but did not publish a result artifact."
 
 
 def make_plan(github: Github, pr: PullRequest, files: list[dict[str, Any]], preview_url: str) -> dict[str, Any]:
@@ -1074,7 +1148,7 @@ def make_plan(github: Github, pr: PullRequest, files: list[dict[str, Any]], prev
         "diff_summary": summarize_files(files),
         "tasks": [task_to_dict(task) for task in tasks],
         "profiles": [profile_to_dict(profile) for profile in profiles],
-        "matrix": build_matrix(tasks, profiles),
+        "matrix": build_matrix(tasks, profiles, attempt=1),
     }
 
 
@@ -1167,6 +1241,7 @@ def command_summarize(args: argparse.Namespace) -> int:
         existing_attempts = {run.attempt for run in runs_by_task[task.check_id]}
         for profile in profiles:
             if profile.attempt not in existing_attempts:
+                status, summary = missing_attempt_status(task.check_id, profile.attempt, runs_by_task)
                 runs_by_task[task.check_id].append(
                     AgentRun(
                         task_id=task.check_id,
@@ -1174,7 +1249,7 @@ def command_summarize(args: argparse.Namespace) -> int:
                         tier=profile.tier,
                         agent=profile.agent,
                         model=profile.model,
-                        status="missing_artifact",
+                        status=status,
                         elapsed_s=0,
                         session_id=None,
                         agent_view_url=None,
@@ -1183,10 +1258,10 @@ def command_summarize(args: argparse.Namespace) -> int:
                             "regression_detected": False,
                             "severity": "none",
                             "confidence": 0,
-                            "summary": "This matrix job did not publish a result artifact.",
+                            "summary": summary,
                             "evidence": [],
                         },
-                        error="missing result artifact",
+                        error=None if status == "skipped_no_escalation" else "missing result artifact",
                     )
                 )
 
@@ -1199,6 +1274,20 @@ def command_summarize(args: argparse.Namespace) -> int:
     append_step_summary(comment.replace(COMMENT_MARKER, ""))
     if any(summary["big_regression"] for summary in summaries):
         return 1
+    return 0
+
+
+def command_matrix(args: argparse.Namespace) -> int:
+    plan = load_json(args.plan_file or find_plan_file(args.artifacts_dir))
+    runs = load_runs(args.artifacts_dir) if Path(args.artifacts_dir).exists() else []
+    matrix = build_escalation_matrix(plan, runs, args.attempt)
+    matrix_json = json.dumps(matrix, separators=(",", ":"))
+    write_github_output("matrix", matrix_json)
+    write_github_output("has_work", "true" if matrix_has_work(matrix) else "false")
+    append_step_summary(
+        f"Prepared attempt {args.attempt} matrix with {len(matrix.get('include', []))} check(s)."
+    )
+    print(matrix_json)
     return 0
 
 
@@ -1244,6 +1333,11 @@ def build_parser() -> argparse.ArgumentParser:
     summarize_parser.add_argument("--artifacts-dir", default="artifacts")
     summarize_parser.add_argument("--plan-file", default="")
 
+    matrix_parser = subparsers.add_parser("matrix", help="Build an escalation matrix from prior results.")
+    matrix_parser.add_argument("--artifacts-dir", default="artifacts")
+    matrix_parser.add_argument("--plan-file", default="")
+    matrix_parser.add_argument("--attempt", required=True, type=int)
+
     subparsers.add_parser("all", help="Run the legacy single-job orchestration.")
     return parser
 
@@ -1256,6 +1350,8 @@ def main() -> int:
         return command_run_agent(args)
     if args.command == "summarize":
         return command_summarize(args)
+    if args.command == "matrix":
+        return command_matrix(args)
     return command_all()
 
 
