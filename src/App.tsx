@@ -47,6 +47,14 @@ type Order = {
   eta: string;
 };
 
+type Bundle = {
+  id: string;
+  name: string;
+  description: string;
+  productIds: string[];
+  badge: string;
+};
+
 const products: Product[] = [
   {
     id: "atlas-pack",
@@ -137,6 +145,22 @@ const initialOrders: Order[] = [
 
 const categories: Category[] = ["All", "Gear", "Home", "Travel", "Wellness"];
 const statuses: FulfillmentStatus[] = ["New", "Packing", "Shipped"];
+const bundles: Bundle[] = [
+  {
+    id: "weekend-reset",
+    name: "Weekend Reset Kit",
+    description: "A ready-to-pack set for short trips, morning coffee, and hotel-room mobility.",
+    productIds: ["atlas-pack", "summit-flask", "focus-mat"],
+    badge: "3 items"
+  },
+  {
+    id: "desk-refresh",
+    name: "Desk Refresh",
+    description: "Small upgrades for a cleaner workspace and late-afternoon focus sessions.",
+    productIds: ["lumen-lamp", "summit-flask"],
+    badge: "2 items"
+  }
+];
 
 function formatMoney(value: number) {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(value);
@@ -191,6 +215,18 @@ function App() {
       }
       return next;
     });
+  }
+
+  function addBundle(bundle: Bundle) {
+    setCart(() => {
+      const next: Cart = {};
+      const firstProductId = bundle.productIds[0];
+      if (firstProductId) {
+        next[firstProductId] = 1;
+      }
+      return next;
+    });
+    setToast(`${bundle.name} added to cart.`);
   }
 
   function submitCheckout() {
@@ -281,8 +317,10 @@ function App() {
             category={category}
             setCategory={setCategory}
             products={filteredProducts}
+            bundles={bundles}
             cart={cart}
             updateCart={updateCart}
+            addBundle={addBundle}
           />
         )}
         {view === "checkout" && (
@@ -320,16 +358,20 @@ function Storefront({
   category,
   setCategory,
   products: visibleProducts,
+  bundles: visibleBundles,
   cart,
-  updateCart
+  updateCart,
+  addBundle
 }: {
   query: string;
   setQuery: (query: string) => void;
   category: Category;
   setCategory: (category: Category) => void;
   products: Product[];
+  bundles: Bundle[];
   cart: Cart;
   updateCart: (productId: string, delta: number) => void;
+  addBundle: (bundle: Bundle) => void;
 }) {
   return (
     <>
@@ -357,6 +399,21 @@ function Storefront({
             </button>
           ))}
         </div>
+      </section>
+
+      <section className="bundle-strip" aria-label="Curated bundles">
+        {visibleBundles.map((bundle) => (
+          <article className="bundle-card" key={bundle.id}>
+            <div>
+              <span>{bundle.badge}</span>
+              <h3>{bundle.name}</h3>
+              <p>{bundle.description}</p>
+            </div>
+            <button className="primary" onClick={() => addBundle(bundle)}>
+              Add bundle <Plus size={16} />
+            </button>
+          </article>
+        ))}
       </section>
 
       <section className="product-grid" aria-label="Products">
