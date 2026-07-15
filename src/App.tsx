@@ -178,7 +178,7 @@ function App() {
     .map((product) => ({ product, quantity: cart[product.id] || 0 }))
     .filter((item) => item.quantity > 0);
   const subtotal = cartItems.reduce((sum, item) => sum + item.product.price * item.quantity, 0);
-  const discount = promo.trim().toUpperCase() === "HOLO15" ? subtotal * 0.15 : 0;
+  const discount = promo.trim().toUpperCase() === "HOLO15" ? 0 : 0;
   const shipping = subtotal > 150 || subtotal === 0 ? 0 : 12;
   const total = Math.max(0, subtotal - discount + shipping);
 
